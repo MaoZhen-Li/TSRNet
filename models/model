@@ -1,1 +1,1406 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import numpy as np
+from pointnet2_ops import pointnet2_utils
 
+from mamba_ssm import Mamba
+
+
+def square_distance(src, dst):
+    return torch.sum((src.unsqueeze(2) - dst.unsqueeze(1)) ** 2, dim=-1)
+
+
+def index_points(points, idx):
+    device = points.device
+    B = points.shape[0]
+    view_shape = list(idx.shape)
+    view_shape[1:] = [1] * (len(view_shape) - 1)
+    repeat_shape = list(idx.shape)
+    repeat_shape[0] = 1
+    batch_indices = torch.arange(B, dtype=torch.long, device=device).reshape(view_shape).repeat(repeat_shape)
+    return points[batch_indices, idx, :]
+
+
+class SceneTypeDetector(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.global_encoder = nn.Sequential(
+            nn.Conv1d(in_channels, in_channels // 2, 1),
+            nn.BatchNorm1d(in_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Conv1d(in_channels // 2, in_channels // 4, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(in_channels // 4, 2, 1),
+            nn.Softmax(dim=1)
+        )
+
+    def forward(self, features):
+        global_desc = self.global_encoder(features)
+        return global_desc.squeeze(-1)
+
+
+class EnhancedNoiseOutlierModule(nn.Module):
+    def __init__(self, in_channels, reduction=8):
+        super().__init__()
+        self.in_channels = in_channels
+        self.local_noise_estimator = nn.Sequential(
+            nn.Conv1d(in_channels, in_channels // reduction, 1),
+            nn.BatchNorm1d(in_channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(in_channels // reduction, in_channels // reduction, 3, padding=1),
+            nn.BatchNorm1d(in_channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(in_channels // reduction, 1, 1),
+            nn.Sigmoid()
+        )
+        self.global_outlier_detector = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Conv1d(in_channels, in_channels // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(in_channels // reduction, 1, 1),
+            nn.Sigmoid()
+        )
+        self.statistical_gate = nn.Sequential(
+            nn.Conv1d(in_channels, in_channels // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(in_channels // reduction, 1, 1),
+            nn.Sigmoid()
+        )
+        self.robust_path = nn.Sequential(
+            nn.Conv1d(in_channels, in_channels, 7, padding=3, groups=in_channels),
+            nn.Conv1d(in_channels, in_channels, 1),
+            nn.BatchNorm1d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(in_channels, in_channels, 7, padding=3, groups=in_channels),
+            nn.Conv1d(in_channels, in_channels, 1),
+            nn.BatchNorm1d(in_channels)
+        )
+        self.fine_path = nn.Sequential(
+            nn.Conv1d(in_channels, in_channels, 1),
+            nn.BatchNorm1d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(in_channels, in_channels, 3, padding=1),
+            nn.BatchNorm1d(in_channels)
+        )
+        self.fusion_weight = nn.Parameter(torch.tensor(0.5))
+        self.calibration = nn.Sequential(
+            nn.Conv1d(in_channels * 2, in_channels, 1),
+            nn.BatchNorm1d(in_channels)
+        )
+
+    def compute_statistical_outlier_score(self, x, threshold=2.5):
+        mean = x.mean(dim=2, keepdim=True)
+        std = x.std(dim=2, keepdim=True).clamp(min=1e-8)
+        z_score = torch.abs(x - mean) / std
+        outlier_mask = (z_score > threshold).float()
+        return outlier_mask.mean(dim=1, keepdim=True)
+
+    def forward(self, x, scene_weights=None):
+        B, C, N = x.shape
+        local_noise = self.local_noise_estimator(x)
+        global_outlier = self.global_outlier_detector(x).expand(-1, -1, N)
+        statistical_outlier = self.compute_statistical_outlier_score(x)
+        statistical_gate = self.statistical_gate(x)
+
+        if scene_weights is not None:
+            natural_w = scene_weights[:, 0:1].reshape(B, 1, 1)
+            urban_w = scene_weights[:, 1:2].reshape(B, 1, 1)
+            noise_outlier_score = (
+                0.6 * local_noise * natural_w +
+                0.3 * global_outlier * urban_w +
+                0.3 * (statistical_outlier * statistical_gate) * urban_w +
+                0.2 * local_noise * urban_w +
+                0.2 * global_outlier * natural_w
+            )
+        else:
+            noise_outlier_score = (
+                0.4 * local_noise +
+                0.3 * global_outlier +
+                0.3 * (statistical_outlier * statistical_gate)
+            )
+
+        robust_feat = self.robust_path(x)
+        fine_feat = self.fine_path(x)
+        adaptive_weight = torch.sigmoid(self.fusion_weight)
+        adaptive_feat = (
+            robust_feat * noise_outlier_score +
+            fine_feat * (1 - noise_outlier_score)
+        ) * adaptive_weight
+        combined = torch.cat([x, adaptive_feat], dim=1)
+        output = self.calibration(combined)
+        output = F.relu(output + x)
+        return output, noise_outlier_score
+
+
+class MultiScaleGeometricPriorModule(nn.Module):
+    def __init__(self, in_channels, k_neighbors=[8, 16, 32], use_robust_pca=True):
+        super().__init__()
+        self.k_list = k_neighbors
+        self.in_channels = in_channels
+        self.use_robust_pca = use_robust_pca
+
+        self.geometric_encoders = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(7, 32), nn.LayerNorm(32), nn.ReLU(inplace=True),
+                nn.Linear(32, 64), nn.LayerNorm(64), nn.ReLU(inplace=True),
+                nn.Linear(64, 32)
+            ) for _ in k_neighbors
+        ])
+        self.scale_attention = nn.Sequential(
+            nn.Linear(32 * len(k_neighbors), 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, len(k_neighbors)),
+            nn.Softmax(dim=-1)
+        )
+        self.scale_fusion = nn.Sequential(
+            nn.Linear(32 * len(k_neighbors), 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 32)
+        )
+        self.ground_confidence_scorer = nn.Sequential(
+            nn.Linear(32, 16), nn.ReLU(inplace=True),
+            nn.Linear(16, 1), nn.Sigmoid()
+        )
+        self.feature_modulator = nn.Sequential(
+            nn.Conv1d(in_channels + 1, in_channels, 1),
+            nn.BatchNorm1d(in_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def compute_local_geometry_robust(self, xyz, k=16):
+        B, N, _ = xyz.shape
+        device = xyz.device
+        dists = torch.cdist(xyz, xyz)
+        knn_idx = dists.topk(k + 1, largest=False, dim=-1)[1][:, :, 1:]
+        knn_xyz = index_points(xyz, knn_idx)
+        centered = knn_xyz - xyz.unsqueeze(2)
+
+        if self.use_robust_pca:
+            distances = torch.norm(centered, dim=-1)
+            median_dist = torch.median(distances, dim=-1, keepdim=True)[0]
+            weights = torch.exp(-((distances - median_dist) ** 2) / (2 * (median_dist ** 2 + 1e-8)))
+            weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            weighted_centered = centered * weights.unsqueeze(-1)
+            cov = torch.matmul(weighted_centered.transpose(-1, -2), centered) / k
+        else:
+            cov = torch.matmul(centered.transpose(-1, -2), centered) / k
+
+        try:
+            cov_reg = cov + torch.eye(3, device=device).reshape(1, 1, 3, 3) * 1e-6
+            eigenvalues, eigenvectors = torch.linalg.eigh(cov_reg)
+            normals = eigenvectors[:, :, :, 0]
+            z_sign = torch.sign(normals[:, :, 2:3])
+            z_sign[z_sign == 0] = 1
+            normals = normals * z_sign
+        except:
+            normals = torch.tensor([0, 0, 1], device=device).reshape(1, 1, 3).expand(B, N, 3)
+            eigenvalues = torch.ones(B, N, 3, device=device)
+
+        eigenvalues_sum = eigenvalues.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        curvature = eigenvalues[:, :, 0:1] / eigenvalues_sum
+        height_diff = knn_xyz[:, :, :, 2] - xyz[:, :, 2:3]
+        height_median = torch.median(height_diff, dim=-1, keepdim=True)[0]
+        height_std = height_diff.std(dim=-1, keepdim=True).clamp(min=1e-8)
+        height_range = (height_diff.max(dim=-1, keepdim=True)[0] - height_diff.min(dim=-1, keepdim=True)[0])
+        return torch.cat([normals, curvature, height_median, height_std, height_range], dim=-1)
+
+    def forward(self, xyz, features, scene_weights=None):
+        B, C, N = features.shape
+        multi_scale_geo_feats = []
+        for k, encoder in zip(self.k_list, self.geometric_encoders):
+            geo_feats = self.compute_local_geometry_robust(xyz, k=k)
+            geo_encoded = encoder(geo_feats)
+            multi_scale_geo_feats.append(geo_encoded)
+
+        multi_scale_concat = torch.cat(multi_scale_geo_feats, dim=-1)
+        scale_att_weights = self.scale_attention(multi_scale_concat)
+
+        if scene_weights is not None:
+            urban_w = scene_weights[:, 1:2].reshape(B, 1, 1)
+            scale_adjustment = torch.tensor([0.9, 1.0, 1.2], device=xyz.device).reshape(1, 1, 3)
+            scale_adjustment = scale_adjustment * urban_w + torch.ones_like(scale_adjustment) * (1 - urban_w)
+            scale_att_weights = scale_att_weights * scale_adjustment
+            scale_att_weights = scale_att_weights / scale_att_weights.sum(dim=-1, keepdim=True)
+
+        weighted_geo_feats = torch.zeros_like(multi_scale_geo_feats[0])
+        for i, geo_feat in enumerate(multi_scale_geo_feats):
+            weighted_geo_feats += geo_feat * scale_att_weights[:, :, i:i + 1]
+
+        fused_geo_feats = self.scale_fusion(multi_scale_concat) + weighted_geo_feats
+        ground_confidence = self.ground_confidence_scorer(fused_geo_feats).permute(0, 2, 1)
+
+        features_with_geo = torch.cat([features, ground_confidence], dim=1)
+        modulated_features = self.feature_modulator(features_with_geo)
+        output = modulated_features + features
+
+        raw_geo_info = {
+            'normals': multi_scale_geo_feats[0][:, :, :3] if multi_scale_geo_feats[0].shape[-1] >= 3 else None,
+            'curvature': self.compute_local_geometry_robust(xyz, k=self.k_list[0])[:, :, 3:4],
+        }
+        return output, ground_confidence, raw_geo_info
+
+
+class SceneAdaptiveDomainAlignment(nn.Module):
+    def __init__(self, in_channels, reduction=4, enable_domain_adapt=True):
+        super().__init__()
+        self.enable_domain_adapt = enable_domain_adapt
+        if enable_domain_adapt:
+            self.instance_norm = nn.InstanceNorm1d(in_channels, affine=True)
+            self.domain_invariant_extractor = nn.Sequential(
+                nn.Conv1d(in_channels, in_channels, 1),
+                nn.BatchNorm1d(in_channels),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.2),
+                nn.Conv1d(in_channels, in_channels, 3, padding=1),
+                nn.BatchNorm1d(in_channels),
+                nn.ReLU(inplace=True)
+            )
+            self.style_branch = nn.Sequential(
+                nn.AdaptiveAvgPool1d(1),
+                nn.Conv1d(in_channels, in_channels // reduction, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv1d(in_channels // reduction, in_channels, 1),
+                nn.Tanh()
+            )
+            self.content_branch = nn.Sequential(
+                nn.Conv1d(in_channels, in_channels, 1),
+                nn.BatchNorm1d(in_channels),
+                nn.ReLU(inplace=True)
+            )
+            self.style_weight = nn.Parameter(torch.tensor(0.05))
+
+    def forward(self, x, scene_weights=None):
+        if not self.enable_domain_adapt:
+            return x
+        if scene_weights is not None:
+            natural_w = scene_weights[:, 0].mean()
+            if natural_w > 0.7:
+                return x
+        x_norm = self.instance_norm(x)
+        domain_inv_feat = self.domain_invariant_extractor(x_norm)
+        style = self.style_branch(x)
+        content = self.content_branch(domain_inv_feat)
+        style_weight = torch.sigmoid(self.style_weight)
+        styled_content = content + style * style_weight
+        return styled_content + x
+
+
+class UncertaintyAwarePrediction(nn.Module):
+    def __init__(self, in_channels, num_classes, dropout=0.4):
+        super().__init__()
+        self.shared_features = nn.Sequential(
+            nn.Conv1d(in_channels, in_channels // 2, 1),
+            nn.BatchNorm1d(in_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout)
+        )
+        self.classifier = nn.Sequential(
+            nn.Conv1d(in_channels // 2, in_channels // 4, 1),
+            nn.BatchNorm1d(in_channels // 4),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout * 0.6),
+            nn.Conv1d(in_channels // 4, num_classes, 1)
+        )
+        self.uncertainty_estimator = nn.Sequential(
+            nn.Conv1d(in_channels // 2, in_channels // 8, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(in_channels // 8, 1, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        shared_feat = self.shared_features(x)
+        logits = self.classifier(shared_feat)
+        uncertainty = self.uncertainty_estimator(shared_feat)
+        return logits, uncertainty
+
+
+class DualPathFeatureFusion(nn.Module):
+    def __init__(self, d0, d1, d2, d3):
+        super().__init__()
+        self.progressive_fuse_3_2 = nn.Sequential(
+            nn.Conv1d(d3 + d2, d2, 1), nn.BatchNorm1d(d2), nn.ReLU(inplace=True),
+            nn.Conv1d(d2, d2, 3, padding=1, groups=d2 // 4),
+            nn.Conv1d(d2, d2, 1), nn.BatchNorm1d(d2), nn.ReLU(inplace=True)
+        )
+        self.progressive_fuse_2_1 = nn.Sequential(
+            nn.Conv1d(d2 + d1, d1, 1), nn.BatchNorm1d(d1), nn.ReLU(inplace=True),
+            nn.Conv1d(d1, d1, 3, padding=1, groups=d1 // 4),
+            nn.Conv1d(d1, d1, 1), nn.BatchNorm1d(d1), nn.ReLU(inplace=True)
+        )
+        self.progressive_fuse_1_0 = nn.Sequential(
+            nn.Conv1d(d1 + d0, d0, 1), nn.BatchNorm1d(d0), nn.ReLU(inplace=True),
+            nn.Conv1d(d0, d0, 3, padding=1, groups=d0 // 4),
+            nn.Conv1d(d0, d0, 1), nn.BatchNorm1d(d0), nn.ReLU(inplace=True)
+        )
+        self.pyramid_convs = nn.ModuleList([
+            nn.Sequential(nn.Conv1d(dim, d0, 1), nn.BatchNorm1d(d0), nn.ReLU(inplace=True))
+            for dim in [d0, d1, d2, d3]
+        ])
+        self.pyramid_fusion = nn.Sequential(
+            nn.Conv1d(d0 * 4, d0, 1), nn.BatchNorm1d(d0), nn.ReLU(inplace=True)
+        )
+        self.dual_path_integration = nn.Sequential(
+            nn.Conv1d(d0 * 2, d0, 1), nn.BatchNorm1d(d0), nn.ReLU(inplace=True),
+            nn.Conv1d(d0, d0, 3, padding=1), nn.BatchNorm1d(d0)
+        )
+        self.global_context = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Conv1d(d0, d0 // 4, 1), nn.ReLU(inplace=True),
+            nn.Conv1d(d0 // 4, d0, 1), nn.Sigmoid()
+        )
+
+    def forward(self, d0_feat, d1_feat, d2_feat, d3_feat, target_size):
+        def align_size(feat, size):
+            if feat.size(2) != size:
+                return F.interpolate(feat, size=size, mode='linear', align_corners=False)
+            return feat
+
+        d0_a = align_size(d0_feat, target_size)
+        d1_a = align_size(d1_feat, target_size)
+        d2_a = align_size(d2_feat, target_size)
+        d3_a = align_size(d3_feat, target_size)
+
+        prog_32 = self.progressive_fuse_3_2(torch.cat([d3_a, d2_a], dim=1))
+        prog_21 = self.progressive_fuse_2_1(torch.cat([prog_32, d1_a], dim=1))
+        prog_out = self.progressive_fuse_1_0(torch.cat([prog_21, d0_a], dim=1))
+
+        pyr_feats = [conv(f) for f, conv in zip([d0_a, d1_a, d2_a, d3_a], self.pyramid_convs)]
+        pyr_out = self.pyramid_fusion(torch.cat(pyr_feats, dim=1))
+
+        dual = self.dual_path_integration(torch.cat([prog_out, pyr_out], dim=1))
+        ctx = self.global_context(dual)
+        return dual * ctx + d0_a
+
+
+class MultiScaleGeometricAttention(nn.Module):
+    def __init__(self, in_channels, reduction=8):
+        super().__init__()
+        self.spatial_conv1 = nn.Conv1d(in_channels, in_channels // reduction, 1)
+        self.spatial_conv3 = nn.Conv1d(in_channels, in_channels // reduction, 3, padding=1)
+        self.spatial_conv5 = nn.Conv1d(in_channels, in_channels // reduction, 5, padding=2)
+        self.spatial_fusion = nn.Sequential(
+            nn.Conv1d(3 * (in_channels // reduction), in_channels // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(in_channels // reduction, 1, 1),
+            nn.Sigmoid()
+        )
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
+        self.channel_fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        sa_fused = torch.cat([self.spatial_conv1(x), self.spatial_conv3(x), self.spatial_conv5(x)], dim=1)
+        sa_weights = self.spatial_fusion(sa_fused)
+        x_sa = x * sa_weights
+        ca_avg = self.channel_fc(self.avg_pool(x_sa).squeeze(2)).unsqueeze(2)
+        ca_max = self.channel_fc(self.max_pool(x_sa).squeeze(2)).unsqueeze(2)
+        ca_weights = ca_avg + ca_max
+        return x_sa * ca_weights + x
+
+
+class PointNetFeaturePropagation(nn.Module):
+    def __init__(self, in_channel, mlp):
+        super().__init__()
+        self.mlp_convs = nn.ModuleList()
+        self.mlp_bns = nn.ModuleList()
+        last_channel = in_channel
+        for out_channel in mlp:
+            self.mlp_convs.append(nn.Conv1d(last_channel, out_channel, 1))
+            self.mlp_bns.append(nn.BatchNorm1d(out_channel))
+            last_channel = out_channel
+
+    def forward(self, xyz1, xyz2, points1, points2):
+        B, N, C = xyz1.shape
+        _, S, _ = xyz2.shape
+        if S == 1:
+            interpolated_points = points2.unsqueeze(1).repeat(1, N, 1)
+        else:
+            dist, idx = pointnet2_utils.three_nn(xyz1, xyz2)
+            dist_recip = 1.0 / (dist + 1e-8)
+            norm = torch.sum(dist_recip, dim=2, keepdim=True)
+            weight = dist_recip / norm
+            grouped_points = pointnet2_utils.grouping_operation(
+                points2.permute(0, 2, 1).contiguous(), idx
+            )
+            interpolated_points = torch.sum(
+                grouped_points.permute(0, 2, 3, 1) * weight.unsqueeze(3), dim=2
+            )
+        if points1 is not None:
+            new_points = torch.cat([points1, interpolated_points], dim=-1)
+        else:
+            new_points = interpolated_points
+        new_points = new_points.permute(0, 2, 1)
+        for i, conv in enumerate(self.mlp_convs):
+            new_points = F.relu(self.mlp_bns[i](conv(new_points)))
+        return new_points
+
+
+class PTV3InspiredTransformerBlock(nn.Module):
+    def __init__(self, d_feats, d_model, k, n_heads=4, dropout_rate=0.1):
+        super().__init__()
+        self.k = k
+        self.n_heads = n_heads
+        self.d_model = d_model
+        self.head_dim = d_model // n_heads
+        assert self.head_dim * n_heads == d_model
+
+        self.fc1 = nn.Linear(d_feats, d_model)
+        self.w_qs = nn.Linear(d_model, d_model, bias=False)
+        self.w_ks = nn.Linear(d_model, d_model, bias=False)
+        self.w_vs = nn.Linear(d_model, d_model, bias=False)
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(3, d_model // 2), nn.GELU(), nn.Linear(d_model // 2, d_model)
+        )
+        self.attn_out = nn.Linear(d_model, d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 2), nn.GELU(),
+            nn.Dropout(dropout_rate), nn.Linear(d_model * 2, d_model)
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm_pos = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout_rate)
+        self.dropout2 = nn.Dropout(dropout_rate)
+
+    def forward(self, xyz, features):
+        B, N, _ = xyz.shape
+        x = self.fc1(features)
+        dists = square_distance(xyz, xyz)
+        knn_idx = dists.argsort()[:, :, 1:self.k + 1]
+        knn_xyz = index_points(xyz, knn_idx)
+        rel_xyz = xyz.unsqueeze(2) - knn_xyz
+        pos_enc = self.norm_pos(self.pos_mlp(rel_xyz))
+
+        x_norm = self.norm1(x)
+        q = self.w_qs(x_norm).reshape(B, N, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        knn_x_norm = index_points(x_norm, knn_idx)
+        k = self.w_ks(knn_x_norm).reshape(B, N, self.k, self.n_heads, self.head_dim).permute(0, 3, 1, 2, 4)
+        v = self.w_vs(knn_x_norm).reshape(B, N, self.k, self.n_heads, self.head_dim).permute(0, 3, 1, 2, 4)
+        pos_enc_kv = pos_enc.reshape(B, N, self.k, self.n_heads, self.head_dim).permute(0, 3, 1, 2, 4)
+        k = k + pos_enc_kv
+        v = v + pos_enc_kv
+
+        attn_scores = (q.unsqueeze(3) @ k.transpose(-1, -2)).squeeze(3) / math.sqrt(self.head_dim)
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_out = (attn_weights.unsqueeze(3) @ v).squeeze(3)
+        attn_out = self.attn_out(attn_out.permute(0, 2, 1, 3).reshape(B, N, self.d_model))
+        x = x + self.dropout1(attn_out)
+        x = x + self.dropout2(self.ffn(self.norm2(x)))
+        return x, attn_weights
+
+
+class SimplifiedKPConvLayer(nn.Module):
+    def __init__(self, in_channels, out_channels, radius, sigma, n_kernel_points=15):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.radius = radius
+        self.sigma = sigma
+        self.n_kernel_points = n_kernel_points
+        _kernel_points = torch.randn(self.n_kernel_points, 3)
+        _kernel_points = _kernel_points / torch.norm(_kernel_points, dim=1, keepdim=True) * self.radius
+        self.register_buffer('kernel_points', _kernel_points)
+        self.weights = nn.Parameter(torch.empty(self.n_kernel_points, in_channels, out_channels))
+        nn.init.kaiming_uniform_(self.weights, a=math.sqrt(5))
+
+    def forward(self, query_xyz, support_xyz, support_features, neighbor_indices):
+        grouped_features = pointnet2_utils.grouping_operation(
+            support_features.permute(0, 2, 1).contiguous(), neighbor_indices
+        ).permute(0, 2, 3, 1).contiguous()
+        grouped_xyz = pointnet2_utils.grouping_operation(
+            support_xyz.transpose(1, 2).contiguous(), neighbor_indices
+        ).permute(0, 2, 3, 1).contiguous()
+        relative_xyz = grouped_xyz - query_xyz.unsqueeze(2)
+        dist_sq = torch.sum(
+            (relative_xyz.unsqueeze(3) - self.kernel_points.reshape(1, 1, 1, self.n_kernel_points, 3)) ** 2, dim=-1
+        )
+        influence = torch.exp(-dist_sq / (2 * self.sigma ** 2))
+        transformed_features = torch.einsum('bsni,kio->bsnko', grouped_features, self.weights)
+        weighted_features = transformed_features * influence.unsqueeze(-1)
+        return torch.sum(weighted_features, dim=(2, 3))
+
+
+class SimplifiedKPResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, radius, sigma, n_kernel_points=15):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.radius = radius
+        self.conv1 = SimplifiedKPConvLayer(in_channels, out_channels, radius, sigma, n_kernel_points)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.conv2 = SimplifiedKPConvLayer(out_channels, out_channels, radius, sigma, n_kernel_points)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.shortcut = (nn.Linear(in_channels, out_channels, bias=False)
+                         if in_channels != out_channels else nn.Identity())
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, query_xyz, support_xyz, support_features, neighbor_indices):
+        grouped_features = pointnet2_utils.grouping_operation(
+            support_features.permute(0, 2, 1).contiguous(), neighbor_indices
+        ).permute(0, 2, 3, 1).contiguous()
+        mean_support_features = grouped_features.mean(dim=2)
+        shortcut_f = self.shortcut(mean_support_features)
+
+        x = self.conv1(query_xyz, support_xyz, support_features, neighbor_indices)
+        x = self.relu(self.bn1(x.permute(0, 2, 1)).permute(0, 2, 1))
+        neighbor_indices_conv2 = pointnet2_utils.ball_query(
+            self.radius, neighbor_indices.shape[-1], query_xyz, query_xyz
+        )
+        x = self.conv2(query_xyz, query_xyz, x, neighbor_indices_conv2)
+        x = self.bn2(x.permute(0, 2, 1)).permute(0, 2, 1)
+        return self.relu(x + shortcut_f)
+
+
+class EnhancedCrossScaleAttentionBlock(nn.Module):
+    def __init__(self, query_dim, key_value_dim, n_heads=4, nsample=16, radius=0.1, dropout_rate=0.1):
+        super().__init__()
+        self.nsample = nsample
+        self.radius = radius
+        self.n_heads = n_heads
+        self.head_dim = query_dim // n_heads
+        assert self.head_dim * n_heads == query_dim
+
+        self.to_q = nn.Linear(query_dim, query_dim, bias=False)
+        self.to_k = nn.Linear(key_value_dim, query_dim, bias=False)
+        self.to_v = nn.Linear(key_value_dim, query_dim, bias=False)
+        self.to_out = nn.Sequential(nn.Linear(query_dim, query_dim), nn.Dropout(dropout_rate))
+        self.norm_q = nn.LayerNorm(query_dim)
+        self.norm_kv = nn.LayerNorm(key_value_dim)
+        self.attention_gate = MultiScaleGeometricAttention(query_dim)
+
+    def forward(self, q_xyz, kv_xyz, query_features, key_value_features):
+        B, N, _ = query_features.shape
+        query_norm = self.norm_q(query_features)
+        kv_norm = self.norm_kv(key_value_features)
+        q = self.to_q(query_norm)
+
+        neighbor_idx = pointnet2_utils.ball_query(self.radius, self.nsample, kv_xyz, q_xyz)
+        grouped_kv = pointnet2_utils.grouping_operation(
+            kv_norm.permute(0, 2, 1).contiguous(), neighbor_idx
+        ).permute(0, 2, 3, 1).contiguous()
+
+        k = self.to_k(grouped_kv)
+        v = self.to_v(grouped_kv)
+
+        q = q.reshape(B, N, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = k.reshape(B, N, self.nsample, self.n_heads, self.head_dim).permute(0, 3, 1, 2, 4)
+        v = v.reshape(B, N, self.nsample, self.n_heads, self.head_dim).permute(0, 3, 1, 2, 4)
+
+        attn_scores = (q.unsqueeze(3) @ k.transpose(-1, -2)).squeeze(3) / math.sqrt(self.head_dim)
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attended_v = (attn_weights.unsqueeze(3) @ v).squeeze(3)
+        output = self.to_out(attended_v.permute(0, 2, 1, 3).reshape(B, N, -1))
+
+        gated_output = self.attention_gate((query_features + output).permute(0, 2, 1)).permute(0, 2, 1)
+        return gated_output
+
+
+class TerrainAwareSerializer(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @torch.no_grad()
+    def compute_principal_slope_direction(self, xyz):
+        B, N, _ = xyz.shape
+        xy = xyz[:, :, :2]
+        mean_xy = xy.mean(dim=1, keepdim=True)
+        centered_xy = xy - mean_xy
+        cov = torch.bmm(centered_xy.transpose(1, 2), centered_xy) / N
+        cov = cov + torch.eye(2, device=xyz.device).unsqueeze(0) * 1e-6
+        try:
+            _, eigvecs = torch.linalg.eigh(cov)
+            principal_dir = eigvecs[:, :, 1]
+        except:
+            principal_dir = torch.tensor([[1.0, 0.0]], device=xyz.device).expand(B, 2)
+        return principal_dir
+
+    def serialize_slope_direction(self, xyz, principal_dir):
+        B, N, _ = xyz.shape
+        xy = xyz[:, :, :2]
+        proj = torch.bmm(xy, principal_dir.unsqueeze(2)).squeeze(2)
+        slope_order = torch.argsort(proj, dim=1)
+        return slope_order
+
+    def serialize_contour_direction(self, xyz, principal_dir):
+        B, N, _ = xyz.shape
+        contour_dir = torch.stack([-principal_dir[:, 1], principal_dir[:, 0]], dim=1)
+        xy = xyz[:, :, :2]
+        proj = torch.bmm(xy, contour_dir.unsqueeze(2)).squeeze(2)
+        contour_order = torch.argsort(proj, dim=1)
+        return contour_order
+
+    def forward(self, xyz):
+        principal_dir = self.compute_principal_slope_direction(xyz)
+        slope_order = self.serialize_slope_direction(xyz, principal_dir)
+        contour_order = self.serialize_contour_direction(xyz, principal_dir)
+
+        B, N = slope_order.shape
+        slope_inv = torch.zeros_like(slope_order)
+        contour_inv = torch.zeros_like(contour_order)
+        slope_inv.scatter_(1, slope_order, torch.arange(N, device=xyz.device).unsqueeze(0).expand(B, N))
+        contour_inv.scatter_(1, contour_order, torch.arange(N, device=xyz.device).unsqueeze(0).expand(B, N))
+
+        return slope_order, contour_order, slope_inv, contour_inv
+
+
+class BidirectionalMambaBlock(nn.Module):
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.mamba_fwd = Mamba(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand
+        )
+        self.mamba_bwd = Mamba(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand
+        )
+        self.norm_fwd = nn.LayerNorm(d_model)
+        self.norm_bwd = nn.LayerNorm(d_model)
+        self.fusion = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU()
+        )
+        self.norm_out = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        out_fwd = self.mamba_fwd(self.norm_fwd(x))
+
+        x_rev = torch.flip(x, dims=[1])
+        out_bwd_rev = self.mamba_bwd(self.norm_bwd(x_rev))
+        out_bwd = torch.flip(out_bwd_rev, dims=[1])
+
+        fused = self.fusion(torch.cat([out_fwd, out_bwd], dim=-1))
+
+        return self.norm_out(fused + x)
+
+
+class BTMamba(nn.Module):
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, dropout=0.1):
+        super().__init__()
+        self.serializer = TerrainAwareSerializer()
+
+        self.slope_mamba = BidirectionalMambaBlock(d_model, d_state, d_conv, expand)
+        self.contour_mamba = BidirectionalMambaBlock(d_model, d_state, d_conv, expand)
+
+        self.path_fusion = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+        self.scene_gate = nn.Sequential(
+            nn.Linear(2, d_model),
+            nn.Sigmoid()
+        )
+
+    def forward(self, xyz, features_bcn, scene_weights=None):
+        B, C, N = features_bcn.shape
+        features_bnc = features_bcn.permute(0, 2, 1).contiguous()
+
+        slope_order, contour_order, slope_inv, contour_inv = self.serializer(xyz)
+
+        slope_idx = slope_order.unsqueeze(-1).expand(-1, -1, C)
+        features_slope = torch.gather(features_bnc, 1, slope_idx)
+        slope_out = self.slope_mamba(features_slope)
+        slope_inv_idx = slope_inv.unsqueeze(-1).expand(-1, -1, C)
+        slope_restored = torch.gather(slope_out, 1, slope_inv_idx)
+
+        contour_idx = contour_order.unsqueeze(-1).expand(-1, -1, C)
+        features_contour = torch.gather(features_bnc, 1, contour_idx)
+        contour_out = self.contour_mamba(features_contour)
+        contour_inv_idx = contour_inv.unsqueeze(-1).expand(-1, -1, C)
+        contour_restored = torch.gather(contour_out, 1, contour_inv_idx)
+
+        F_merged = self.path_fusion(
+            torch.cat([slope_restored, contour_restored], dim=-1)
+        )
+
+        if scene_weights is not None:
+            gate = self.scene_gate(scene_weights).unsqueeze(1)
+            F_gate = slope_restored * gate + contour_restored * (1 - gate)
+            F_fused = 0.5 * F_merged + 0.5 * F_gate
+        else:
+            F_fused = F_merged
+
+        out = self.norm(F_fused + features_bnc)
+        return out.permute(0, 2, 1).contiguous()
+
+
+class TerrainComplexityAwareSampling(nn.Module):
+    def __init__(self, alpha=0.4, beta=0.4, gamma=0.2, k_density=16):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.k_density = k_density
+
+        self.log_alpha = nn.Parameter(torch.tensor(math.log(alpha)))
+        self.log_beta = nn.Parameter(torch.tensor(math.log(beta)))
+        self.log_gamma = nn.Parameter(torch.tensor(math.log(gamma)))
+
+    def compute_complexity_score(self, xyz, geo_info=None):
+        B, N = xyz.shape[0], xyz.shape[1]
+        device = xyz.device
+
+        alpha = torch.exp(self.log_alpha)
+        beta = torch.exp(self.log_beta)
+        gamma = torch.exp(self.log_gamma)
+        weight_sum = alpha + beta + gamma
+        alpha = alpha / weight_sum
+        beta = beta / weight_sum
+        gamma = gamma / weight_sum
+
+        if geo_info is not None and geo_info.get('curvature') is not None:
+            curvature = geo_info['curvature'].squeeze(-1)
+        else:
+            dists = torch.cdist(xyz, xyz)
+            knn_idx = dists.topk(self.k_density + 1, largest=False, dim=-1)[1][:, :, 1:]
+            knn_xyz = index_points(xyz, knn_idx)
+            centered = knn_xyz - xyz.unsqueeze(2)
+            cov = torch.matmul(centered.transpose(-1, -2), centered) / self.k_density
+            cov = cov + torch.eye(3, device=device).reshape(1, 1, 3, 3) * 1e-6
+            try:
+                eigenvalues, _ = torch.linalg.eigh(cov)
+                eigenvalues_sum = eigenvalues.sum(dim=-1).clamp(min=1e-8)
+                curvature = eigenvalues[:, :, 0] / eigenvalues_sum
+            except:
+                curvature = torch.zeros(B, N, device=device)
+
+        if geo_info is not None and geo_info.get('normals') is not None:
+            normals = geo_info['normals']
+            slope_indicator = 1.0 - torch.abs(normals[:, :, 2]).clamp(0, 1)
+        else:
+            dists = torch.cdist(xyz, xyz)
+            knn_idx = dists.topk(self.k_density + 1, largest=False, dim=-1)[1][:, :, 1:]
+            knn_xyz = index_points(xyz, knn_idx)
+            centered = knn_xyz - xyz.unsqueeze(2)
+            cov = torch.matmul(centered.transpose(-1, -2), centered) / self.k_density
+            cov = cov + torch.eye(3, device=device).reshape(1, 1, 3, 3) * 1e-6
+            try:
+                _, eigvecs = torch.linalg.eigh(cov)
+                normals = eigvecs[:, :, :, 0]
+                z_sign = torch.sign(normals[:, :, 2:3])
+                z_sign[z_sign == 0] = 1
+                normals = normals * z_sign
+                slope_indicator = 1.0 - torch.abs(normals[:, :, 2]).clamp(0, 1)
+            except:
+                slope_indicator = torch.zeros(B, N, device=device)
+
+        with torch.no_grad():
+            dists_for_density = torch.cdist(xyz[:, :, :2], xyz[:, :, :2])
+            knn_dists = dists_for_density.topk(self.k_density + 1, largest=False, dim=-1)[0][:, :, 1:]
+            local_density = 1.0 / (knn_dists.mean(dim=-1) + 1e-4)
+            local_density_norm = local_density / (local_density.max(dim=-1, keepdim=True)[0] + 1e-8)
+            sparsity = 1.0 - local_density_norm
+
+        sigma = alpha * curvature + beta * slope_indicator + gamma * sparsity
+        return sigma
+
+    def sample(self, xyz, n_sample, geo_info=None):
+        B, N, _ = xyz.shape
+        device = xyz.device
+
+        sigma = self.compute_complexity_score(xyz, geo_info)
+
+        temperature = 0.1
+        prob = F.softmax(sigma / temperature, dim=-1)
+
+        log_prob = torch.log(prob + 1e-10)
+        if self.training:
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(log_prob) + 1e-10) + 1e-10)
+            perturbed = log_prob + gumbel_noise
+        else:
+            perturbed = log_prob
+        sample_idx = perturbed.topk(n_sample, dim=-1)[1]
+
+        return sample_idx.long()
+
+
+class ElevationRegressionHead(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.regressor = nn.Sequential(
+            nn.Conv1d(in_channels, in_channels * 2, 1),
+            nn.BatchNorm1d(in_channels * 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.3),
+            nn.Conv1d(in_channels * 2, in_channels, 1),
+            nn.BatchNorm1d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(in_channels, 1, 1)
+        )
+
+    def forward(self, features):
+        return self.regressor(features)
+
+
+class DTMRasterConsistencyLoss(nn.Module):
+    def __init__(self, grid_size=32):
+        super().__init__()
+        self.grid_size = grid_size
+
+    def rasterize_to_grid(self, xyz, z_values, ground_mask, grid_size):
+        B, N, _ = xyz.shape
+        device = xyz.device
+
+        xy = xyz[:, :, :2]
+        xy_min = xy.min(dim=1, keepdim=True)[0]
+        xy_max = xy.max(dim=1, keepdim=True)[0]
+        xy_norm = (xy - xy_min) / (xy_max - xy_min + 1e-8)
+        grid_xy = (xy_norm * (grid_size - 1)).long().clamp(0, grid_size - 1)
+
+        dtm_grids = torch.full((B, grid_size, grid_size), float('nan'), device=device)
+        count_grids = torch.zeros(B, grid_size, grid_size, device=device)
+
+        for b in range(B):
+            mask = ground_mask[b]
+            if mask.sum() == 0:
+                continue
+            gx = grid_xy[b, mask, 0]
+            gy = grid_xy[b, mask, 1]
+            gz = z_values[b, mask]
+
+            flat_idx = gx * grid_size + gy
+            dtm_flat = torch.zeros(grid_size * grid_size, device=device)
+            count_flat = torch.zeros(grid_size * grid_size, device=device)
+            dtm_flat.scatter_add_(0, flat_idx, gz)
+            count_flat.scatter_add_(0, flat_idx, torch.ones_like(gz))
+
+            valid = count_flat > 0
+            dtm_flat[valid] = dtm_flat[valid] / count_flat[valid]
+            dtm_flat[~valid] = float('nan')
+            dtm_grids[b] = dtm_flat.reshape(grid_size, grid_size)
+
+        return dtm_grids
+
+    def forward(self, xyz, pred_z, gt_z, pred_ground_prob, gt_ground_mask):
+        B = xyz.shape[0]
+        device = xyz.device
+
+        pred_z_weighted = pred_z * pred_ground_prob
+
+        ref_dtm = self.rasterize_to_grid(xyz, gt_z, gt_ground_mask, self.grid_size)
+        pred_dtm = self.rasterize_to_grid(xyz, pred_z_weighted, gt_ground_mask, self.grid_size)
+
+        valid_mask = (~torch.isnan(ref_dtm)) & (~torch.isnan(pred_dtm))
+
+        if valid_mask.sum() == 0:
+            return torch.tensor(0.0, device=device)
+
+        loss = F.mse_loss(
+            pred_dtm[valid_mask],
+            ref_dtm[valid_mask].detach()
+        )
+        return loss
+
+
+class DGER(nn.Module):
+    def __init__(self, in_channels, k_tscl=8, grid_size=32):
+        super().__init__()
+        self.k_tscl = k_tscl
+
+        self.elev_head = ElevationRegressionHead(in_channels)
+
+        self.dtm_raster_loss = DTMRasterConsistencyLoss(grid_size=grid_size)
+
+    def compute_tscl(self, xyz, pred_delta_z, gt_delta_z, ground_mask):
+        B, N, _ = xyz.shape
+        device = xyz.device
+
+        xy = xyz[:, :, :2]
+        xy_dists = torch.cdist(xy, xy)
+        knn_dists, knn_idx = xy_dists.topk(self.k_tscl + 1, largest=False, dim=-1)
+        knn_dists = knn_dists[:, :, 1:]
+        knn_idx = knn_idx[:, :, 1:]
+
+        sigma_xy = knn_dists.mean(dim=-1, keepdim=True) + 1e-8
+        w_ij = torch.exp(-knn_dists ** 2 / (2 * sigma_xy ** 2))
+
+        pred_z_i = pred_delta_z.unsqueeze(2)
+        pred_z_j = index_points(pred_delta_z.unsqueeze(-1), knn_idx).squeeze(-1)
+        pred_diff = pred_z_i - pred_z_j
+
+        gt_z_i = gt_delta_z.unsqueeze(2)
+        gt_z_j = index_points(gt_delta_z.unsqueeze(-1), knn_idx).squeeze(-1)
+        gt_diff = gt_z_i - gt_z_j
+
+        ground_mask_f = ground_mask.float()
+        per_pair_loss = w_ij * (pred_diff - gt_diff) ** 2
+        masked_loss = per_pair_loss * ground_mask_f.unsqueeze(-1)
+
+        tscl = masked_loss.sum() / (ground_mask_f.sum() * self.k_tscl + 1e-8)
+        return tscl
+
+    def forward(self, features, xyz, gt_labels=None, scene_weights=None):
+        pred_delta_z = self.elev_head(features).squeeze(1)
+
+        elev_losses = {}
+
+        if gt_labels is not None and self.training:
+            B, N = gt_labels.shape
+            device = features.device
+
+            z = xyz[:, :, 2]
+            z_min = z.min(dim=1, keepdim=True)[0]
+            z_max = z.max(dim=1, keepdim=True)[0]
+            gt_delta_z = (z - z_min) / (z_max - z_min + 1e-8)
+
+            ground_mask = (gt_labels == 0)
+
+            if ground_mask.sum() > 0:
+                l_elev = F.smooth_l1_loss(
+                    pred_delta_z[ground_mask],
+                    gt_delta_z[ground_mask].detach()
+                )
+            else:
+                l_elev = torch.tensor(0.0, device=device)
+
+            l_tscl = self.compute_tscl(xyz, pred_delta_z, gt_delta_z, ground_mask)
+
+            if scene_weights is not None:
+                natural_w = scene_weights[:, 0].mean()
+                urban_w = scene_weights[:, 1].mean()
+                tscl_weight = 0.5 + 0.5 * natural_w.item()
+            else:
+                tscl_weight = 0.7
+
+            elev_losses['l_elev'] = l_elev
+            elev_losses['l_tscl'] = l_tscl
+            elev_losses['tscl_weight'] = tscl_weight
+
+        return pred_delta_z, elev_losses
+
+
+class TSRNet(nn.Module):
+    def __init__(self, num_classes, in_channels=11, k_transformer=24, n_heads_transformer=8,
+                 kp_radius_scale=6.0, kp_sigma_scale=1.0, kp_n_kernel_points=15, kp_nsample=32,
+                 enable_domain_adapt=False,
+                 mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
+                 tcas_alpha=0.4, tcas_beta=0.4, tcas_gamma=0.2,
+                 dger_k_tscl=8, dger_grid_size=32):
+        super(TSRNet, self).__init__()
+
+        self.num_classes = num_classes
+        self.kp_nsample = kp_nsample
+        self.radii = [r * kp_radius_scale for r in [0.15, 0.3, 0.6, 1.2]]
+        self.sigmas = [r * kp_sigma_scale for r in self.radii]
+        d0, d1, d2, d3, d4 = 64, 128, 256, 512, 1024
+
+        self.initial_embed = nn.Sequential(
+            nn.Conv1d(in_channels, d0, 1), nn.BatchNorm1d(d0), nn.ReLU(inplace=True),
+            nn.Conv1d(d0, d0, 1), nn.BatchNorm1d(d0), nn.ReLU(inplace=True)
+        )
+        self.scene_detector = SceneTypeDetector(d0)
+
+        self.kpconv1 = SimplifiedKPResidualBlock(d0, d1, self.radii[0], self.sigmas[0], kp_n_kernel_points)
+        self.transformer1 = PTV3InspiredTransformerBlock(d1, d1, k_transformer, n_heads_transformer)
+        self.noise_outlier1 = EnhancedNoiseOutlierModule(d1)
+        self.domain_align1 = SceneAdaptiveDomainAlignment(d1, enable_domain_adapt=enable_domain_adapt)
+
+        self.kpconv2 = SimplifiedKPResidualBlock(d1, d2, self.radii[1], self.sigmas[1], kp_n_kernel_points)
+        self.transformer2 = PTV3InspiredTransformerBlock(d2, d2, k_transformer, n_heads_transformer)
+        self.noise_outlier2 = EnhancedNoiseOutlierModule(d2)
+        self.domain_align2 = SceneAdaptiveDomainAlignment(d2, enable_domain_adapt=enable_domain_adapt)
+
+        self.kpconv3 = SimplifiedKPResidualBlock(d2, d3, self.radii[2], self.sigmas[2], kp_n_kernel_points)
+        self.transformer3 = PTV3InspiredTransformerBlock(d3, d3, k_transformer, n_heads_transformer)
+        self.noise_outlier3 = EnhancedNoiseOutlierModule(d3)
+        self.domain_align3 = SceneAdaptiveDomainAlignment(d3, enable_domain_adapt=enable_domain_adapt)
+
+        self.kpconv4 = SimplifiedKPResidualBlock(d3, d4, self.radii[3], self.sigmas[3], kp_n_kernel_points)
+        self.transformer4 = PTV3InspiredTransformerBlock(d4, d4, k_transformer, n_heads_transformer)
+
+        k_attn = 16
+        self.upsample4 = PointNetFeaturePropagation(in_channel=d4, mlp=[d3])
+        self.cs_attn3 = EnhancedCrossScaleAttentionBlock(d3, d3, n_heads_transformer, k_attn, self.radii[2])
+        self.decoder_mlp3 = nn.Sequential(nn.Conv1d(d3, d3, 1), nn.BatchNorm1d(d3), nn.ReLU(inplace=True))
+
+        self.upsample3 = PointNetFeaturePropagation(in_channel=d3, mlp=[d2])
+        self.cs_attn2 = EnhancedCrossScaleAttentionBlock(d2, d2, n_heads_transformer, k_attn, self.radii[1])
+        self.decoder_mlp2 = nn.Sequential(nn.Conv1d(d2, d2, 1), nn.BatchNorm1d(d2), nn.ReLU(inplace=True))
+
+        self.upsample2 = PointNetFeaturePropagation(in_channel=d2, mlp=[d1])
+        self.cs_attn1 = EnhancedCrossScaleAttentionBlock(d1, d1, n_heads_transformer, k_attn, self.radii[0])
+        self.decoder_mlp1 = nn.Sequential(nn.Conv1d(d1, d1, 1), nn.BatchNorm1d(d1), nn.ReLU(inplace=True))
+
+        self.upsample1 = PointNetFeaturePropagation(in_channel=d1, mlp=[d0])
+        self.cs_attn0 = EnhancedCrossScaleAttentionBlock(d0, d0, n_heads_transformer, k_attn, self.radii[0])
+        self.decoder_mlp0 = nn.Sequential(nn.Conv1d(d0, d0, 1), nn.BatchNorm1d(d0), nn.ReLU(inplace=True))
+
+        self.geometric_prior = MultiScaleGeometricPriorModule(d0, k_neighbors=[8, 16, 32])
+        self.dual_path_fusion = DualPathFeatureFusion(d0, d1, d2, d3)
+        self.uncertainty_predictor = UncertaintyAwarePrediction(d0, num_classes, dropout=0.4)
+
+        self.btmamba1 = BTMamba(d1, mamba_d_state, mamba_d_conv, mamba_expand)
+        self.btmamba2 = BTMamba(d2, mamba_d_state, mamba_d_conv, mamba_expand)
+        self.btmamba3 = BTMamba(d3, mamba_d_state, mamba_d_conv, mamba_expand)
+        self.btmamba4 = BTMamba(d4, mamba_d_state, mamba_d_conv, mamba_expand)
+
+        self.tcas = TerrainComplexityAwareSampling(tcas_alpha, tcas_beta, tcas_gamma)
+
+        self.dger = DGER(d0, dger_k_tscl, dger_grid_size)
+
+    def _tcas_sample(self, xyz, n_sample, geo_info=None):
+        return self.tcas.sample(xyz, n_sample, geo_info)
+
+    def forward(self, xyz_and_features_bcn, gt_labels=None):
+        xyz_and_features_bnc = xyz_and_features_bcn.permute(0, 2, 1).contiguous()
+        l0_xyz_bnc = xyz_and_features_bnc[..., :3].contiguous()
+        l0_features_bcn = self.initial_embed(xyz_and_features_bcn)
+        l0_features_bnc = l0_features_bcn.permute(0, 2, 1).contiguous()
+
+        scene_weights = self.scene_detector(l0_features_bcn)
+
+        N0 = l0_xyz_bnc.shape[1]
+        n1_points = N0 // 4
+        l1_tcas_idx = self._tcas_sample(l0_xyz_bnc, n1_points, geo_info=None)
+        l1_xyz_bnc = index_points(l0_xyz_bnc, l1_tcas_idx)
+
+        l1_kp_neighbors_idx = pointnet2_utils.ball_query(
+            self.radii[0], self.kp_nsample, l0_xyz_bnc, l1_xyz_bnc
+        )
+        s1_kp_features = self.kpconv1(l1_xyz_bnc, l0_xyz_bnc, l0_features_bnc, l1_kp_neighbors_idx)
+        s1_t_features, _ = self.transformer1(l1_xyz_bnc, s1_kp_features)
+
+        s1_t_features_bcn = s1_t_features.permute(0, 2, 1).contiguous()
+        s1_t_features_bcn = self.btmamba1(l1_xyz_bnc, s1_t_features_bcn, scene_weights)
+
+        s1_adapted, noise1 = self.noise_outlier1(s1_t_features_bcn, scene_weights)
+        s1_aligned = self.domain_align1(s1_adapted, scene_weights)
+        s1_t_features = s1_aligned.permute(0, 2, 1).contiguous()
+
+        n2_points = n1_points // 4
+        l2_tcas_idx = self._tcas_sample(l1_xyz_bnc, n2_points, geo_info=None)
+        l2_xyz_bnc = index_points(l1_xyz_bnc, l2_tcas_idx)
+
+        l2_kp_neighbors_idx = pointnet2_utils.ball_query(
+            self.radii[1], self.kp_nsample, l1_xyz_bnc, l2_xyz_bnc
+        )
+        s2_kp_features = self.kpconv2(l2_xyz_bnc, l1_xyz_bnc, s1_t_features, l2_kp_neighbors_idx)
+        s2_t_features, _ = self.transformer2(l2_xyz_bnc, s2_kp_features)
+
+        s2_t_features_bcn = s2_t_features.permute(0, 2, 1).contiguous()
+        s2_t_features_bcn = self.btmamba2(l2_xyz_bnc, s2_t_features_bcn, scene_weights)
+
+        s2_adapted, noise2 = self.noise_outlier2(s2_t_features_bcn, scene_weights)
+        s2_aligned = self.domain_align2(s2_adapted, scene_weights)
+        s2_t_features = s2_aligned.permute(0, 2, 1).contiguous()
+
+        n3_points = n2_points // 4
+        l3_tcas_idx = self._tcas_sample(l2_xyz_bnc, n3_points, geo_info=None)
+        l3_xyz_bnc = index_points(l2_xyz_bnc, l3_tcas_idx)
+
+        l3_kp_neighbors_idx = pointnet2_utils.ball_query(
+            self.radii[2], self.kp_nsample, l2_xyz_bnc, l3_xyz_bnc
+        )
+        s3_kp_features = self.kpconv3(l3_xyz_bnc, l2_xyz_bnc, s2_t_features, l3_kp_neighbors_idx)
+        s3_t_features, _ = self.transformer3(l3_xyz_bnc, s3_kp_features)
+
+        s3_t_features_bcn = s3_t_features.permute(0, 2, 1).contiguous()
+        s3_t_features_bcn = self.btmamba3(l3_xyz_bnc, s3_t_features_bcn, scene_weights)
+
+        s3_adapted, noise3 = self.noise_outlier3(s3_t_features_bcn, scene_weights)
+        s3_aligned = self.domain_align3(s3_adapted, scene_weights)
+        s3_t_features = s3_aligned.permute(0, 2, 1).contiguous()
+
+        n4_points = n3_points // 4
+        l4_tcas_idx = self._tcas_sample(l3_xyz_bnc, n4_points, geo_info=None)
+        l4_xyz_bnc = index_points(l3_xyz_bnc, l4_tcas_idx)
+
+        l4_kp_neighbors_idx = pointnet2_utils.ball_query(
+            self.radii[3], self.kp_nsample, l3_xyz_bnc, l4_xyz_bnc
+        )
+        s4_kp_features = self.kpconv4(l4_xyz_bnc, l3_xyz_bnc, s3_t_features, l4_kp_neighbors_idx)
+        s4_t_features, _ = self.transformer4(l4_xyz_bnc, s4_kp_features)
+
+        s4_t_features_bcn = s4_t_features.permute(0, 2, 1).contiguous()
+        s4_t_features_bcn = self.btmamba4(l4_xyz_bnc, s4_t_features_bcn, scene_weights)
+        s4_t_features = s4_t_features_bcn.permute(0, 2, 1).contiguous()
+
+        s0_bnc = l0_features_bnc
+        s1_bnc = s1_t_features
+        s2_bnc = s2_t_features
+        s3_bnc = s3_t_features
+
+        d3_up_bnc = self.upsample4(
+            l3_xyz_bnc, l4_xyz_bnc, None, s4_t_features
+        ).permute(0, 2, 1).contiguous()
+        d3_fused_bnc = self.cs_attn3(l3_xyz_bnc, l3_xyz_bnc, d3_up_bnc, s3_bnc)
+        d3_out_bcn = self.decoder_mlp3(d3_fused_bnc.permute(0, 2, 1).contiguous())
+
+        d2_up_bnc = self.upsample3(
+            l2_xyz_bnc, l3_xyz_bnc, None, d3_out_bcn.permute(0, 2, 1).contiguous()
+        ).permute(0, 2, 1).contiguous()
+        d2_fused_bnc = self.cs_attn2(l2_xyz_bnc, l2_xyz_bnc, d2_up_bnc, s2_bnc)
+        d2_out_bcn = self.decoder_mlp2(d2_fused_bnc.permute(0, 2, 1).contiguous())
+
+        d1_up_bnc = self.upsample2(
+            l1_xyz_bnc, l2_xyz_bnc, None, d2_out_bcn.permute(0, 2, 1).contiguous()
+        ).permute(0, 2, 1).contiguous()
+        d1_fused_bnc = self.cs_attn1(l1_xyz_bnc, l1_xyz_bnc, d1_up_bnc, s1_bnc)
+        d1_out_bcn = self.decoder_mlp1(d1_fused_bnc.permute(0, 2, 1).contiguous())
+
+        d0_up_bnc = self.upsample1(
+            l0_xyz_bnc, l1_xyz_bnc, None, d1_out_bcn.permute(0, 2, 1).contiguous()
+        ).permute(0, 2, 1).contiguous()
+        d0_fused_bnc = self.cs_attn0(l0_xyz_bnc, l0_xyz_bnc, d0_up_bnc, s0_bnc)
+        d0_out_bcn = self.decoder_mlp0(d0_fused_bnc.permute(0, 2, 1).contiguous())
+
+        geo_enhanced_features, ground_confidence, raw_geo_info = self.geometric_prior(
+            l0_xyz_bnc, d0_out_bcn, scene_weights
+        )
+        target_size = d0_out_bcn.size(2)
+        fused_features = self.dual_path_fusion(
+            geo_enhanced_features, d1_out_bcn, d2_out_bcn, d3_out_bcn, target_size
+        )
+
+        pred_delta_z, elev_losses = self.dger(
+            fused_features, l0_xyz_bnc, gt_labels, scene_weights
+        )
+
+        logits, uncertainty = self.uncertainty_predictor(fused_features)
+
+        final_log_softmax = F.log_softmax(logits, dim=1)
+        final_output_bnc = final_log_softmax.permute(0, 2, 1).contiguous()
+
+        return {
+            'output': final_output_bnc,
+            'logits': logits,
+            'pred_delta_z': pred_delta_z,
+            'uncertainty': uncertainty.squeeze(1),
+            'ground_confidence': ground_confidence.squeeze(1),
+            'noise_scores': [n.squeeze(1) for n in [noise1, noise2, noise3]],
+            'scene_weights': scene_weights,
+            'elev_losses': elev_losses
+        }
+
+
+class TSRNetLoss(nn.Module):
+    def __init__(self, num_classes=2, ground_class_id=0,
+                 lambda1_base=0.5,
+                 lambda2_base=0.3,
+                 lambda3=0.08,
+                 lambda4=0.2,
+                 class_weights=None):
+        super().__init__()
+        self.num_classes = num_classes
+        self.ground_class_id = ground_class_id
+        self.lambda1_base = lambda1_base
+        self.lambda2_base = lambda2_base
+        self.lambda3 = lambda3
+        self.lambda4 = lambda4
+        self.class_weights = class_weights
+        self.ignore_index = -100
+
+        self.dtm_raster_loss_fn = DTMRasterConsistencyLoss(grid_size=32)
+
+    def forward(self, pred, target, xyz=None):
+        outputs = pred['output']
+        scene_weights = pred.get('scene_weights', None)
+        elev_losses = pred.get('elev_losses', {})
+        pred_delta_z = pred.get('pred_delta_z', None)
+
+        B, N, C = outputs.shape
+        if target.dim() == 3:
+            target = target.squeeze(-1)
+
+        logits_flat = outputs.reshape(B * N, C)
+        targets_flat = target.reshape(B * N)
+        uncertainty_flat = pred['uncertainty'].reshape(B * N)
+        ground_confidence_flat = pred['ground_confidence'].reshape(B * N)
+
+        base_loss = F.nll_loss(
+            logits_flat, targets_flat,
+            weight=self.class_weights,
+            ignore_index=self.ignore_index,
+            reduction='none'
+        )
+        weighted_base_loss = (base_loss * (1.0 + 0.5 * uncertainty_flat)).mean()
+
+        pred_labels = logits_flat.argmax(dim=1)
+        is_correct = (pred_labels == targets_flat).float()
+        target_uncertainty = 1.0 - is_correct * 0.8
+        unc_loss = F.mse_loss(uncertainty_flat, target_uncertainty.detach())
+
+        ground_mask_flat = (targets_flat == self.ground_class_id).float()
+        ground_conf_loss = -torch.log(ground_confidence_flat + 1e-8) * ground_mask_flat
+        non_ground_conf_loss = -torch.log(1 - ground_confidence_flat + 1e-8) * (1 - ground_mask_flat)
+        ground_loss = (ground_conf_loss.sum() + non_ground_conf_loss.sum()) / (targets_flat.numel() + 1e-8)
+        l_scene = unc_loss * 0.08 + ground_loss * 0.30
+
+        if scene_weights is not None:
+            natural_w = scene_weights[:, 0].mean().item()
+            urban_w = scene_weights[:, 1].mean().item()
+            lambda1 = self.lambda1_base * (1.0 + 0.3 * urban_w)
+            lambda2 = self.lambda2_base * (1.0 + 0.5 * natural_w - 0.3 * urban_w)
+        else:
+            lambda1 = self.lambda1_base
+            lambda2 = self.lambda2_base
+
+        l_elev = elev_losses.get('l_elev', torch.tensor(0.0, device=logits_flat.device))
+        l_tscl = elev_losses.get('l_tscl', torch.tensor(0.0, device=logits_flat.device))
+
+        l_dtm = torch.tensor(0.0, device=logits_flat.device)
+        if xyz is not None and pred_delta_z is not None:
+            ground_mask_2d = (target == self.ground_class_id)
+            z = xyz[:, :, 2]
+            z_min = z.min(dim=1, keepdim=True)[0]
+            z_max = z.max(dim=1, keepdim=True)[0]
+            gt_delta_z = (z - z_min) / (z_max - z_min + 1e-8)
+
+            pred_ground_prob = torch.exp(outputs[:, :, self.ground_class_id])
+            l_dtm = self.dtm_raster_loss_fn(
+                xyz, pred_delta_z, gt_delta_z, pred_ground_prob, ground_mask_2d
+            )
+
+        total_loss = (
+            weighted_base_loss +
+            lambda1 * l_elev +
+            lambda2 * l_tscl +
+            self.lambda3 * l_scene +
+            self.lambda4 * l_dtm
+        )
+
+        return total_loss, {
+            'l_cls': weighted_base_loss.item(),
+            'l_elev': l_elev.item() if isinstance(l_elev, torch.Tensor) else 0.0,
+            'l_tscl': l_tscl.item() if isinstance(l_tscl, torch.Tensor) else 0.0,
+            'l_scene': l_scene.item(),
+            'l_dtm': l_dtm.item() if isinstance(l_dtm, torch.Tensor) else 0.0,
+            'lambda1': lambda1,
+            'lambda2': lambda2,
+        }
+
+
+def get_model(num_classes, **kwargs):
+    return TSRNet(num_classes=num_classes, **kwargs)
+
+
+class get_loss(nn.Module):
+    def __init__(self, num_classes=2, ground_class_id=0):
+        super().__init__()
+        self.loss_fn = TSRNetLoss(
+            num_classes=num_classes,
+            ground_class_id=ground_class_id
+        )
+
+    def forward(self, pred, target, trans_feat=None, weight=None, xyz=None):
+        loss, loss_dict = self.loss_fn(pred, target, xyz=xyz)
+        return loss
+
+
+class TSRNetTrainer:
+    @staticmethod
+    def compute_rmse(pred_delta_z, xyz, gt_labels, ground_class_id=0):
+        z = xyz[:, :, 2]
+        z_min = z.min(dim=1, keepdim=True)[0]
+        z_max = z.max(dim=1, keepdim=True)[0]
+        gt_delta_z = (z - z_min) / (z_max - z_min + 1e-8)
+        ground_mask = (gt_labels == ground_class_id)
+        if ground_mask.sum() == 0:
+            return torch.tensor(0.0)
+        mse = F.mse_loss(pred_delta_z[ground_mask], gt_delta_z[ground_mask])
+        z_range = (z_max - z_min).mean()
+        rmse = torch.sqrt(mse) * z_range
+        return rmse.item()
+
+    @staticmethod
+    def training_step(model, loss_fn, optimizer, batch):
+        model.train()
+        optimizer.zero_grad()
+
+        features = batch['features']
+        gt_labels = batch['labels']
+        xyz = batch['xyz']
+
+        pred = model(features, gt_labels=gt_labels)
+
+        loss, loss_dict = loss_fn.loss_fn(pred, gt_labels, xyz=xyz)
+
+        loss.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            rmse = TSRNetTrainer.compute_rmse(
+                pred['pred_delta_z'], xyz, gt_labels
+            )
+
+        return loss.item(), loss_dict, rmse
+
+    @staticmethod
+    def inference_step(model, features):
+        model.eval()
+        with torch.no_grad():
+            pred = model(features, gt_labels=None)
+        return pred
+
+
+if __name__ == '__main__':
+    print("=" * 80)
+    print("TSRNet V3 - Terrain Surface Reconstruction Network")
+    print("=" * 80)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"\n使用设备: {device}")
+
+    B, N, C_in, num_classes = 2, 8192, 11, 2
+
+    model = get_model(num_classes=num_classes, in_channels=C_in).to(device)
+    loss_fn = TSRNetLoss(num_classes=num_classes).to(device)
+
+    features = torch.randn(B, C_in, N).to(device)
+    labels = torch.randint(0, num_classes, (B, N)).to(device)
+    xyz = features[:, :3, :].permute(0, 2, 1).contiguous()
+
+    print("\n[测试前向传播（训练模式）]")
+    model.train()
+    pred = model(features, gt_labels=labels)
+    print(f"  ✓ output shape: {pred['output'].shape}")
+    print(f"  ✓ pred_delta_z shape: {pred['pred_delta_z'].shape}")
+    print(f"  ✓ scene_weights: natural={pred['scene_weights'][:,0].mean():.3f}, "
+          f"urban={pred['scene_weights'][:,1].mean():.3f}")
+    print(f"  ✓ elev_losses: {list(pred['elev_losses'].keys())}")
+
+    print("\n[测试联合损失]")
+    loss, loss_dict = loss_fn(pred, labels, xyz=xyz)
+    print(f"  ✓ Total loss: {loss.item():.4f}")
+    for k, v in loss_dict.items():
+        if isinstance(v, float):
+            print(f"    - {k}: {v:.4f}")
+
+    print("\n[测试推理模式]")
+    model.eval()
+    with torch.no_grad():
+        pred_infer = model(features, gt_labels=None)
+    print(f"  ✓ 推理输出 output: {pred_infer['output'].shape}")
+    print(f"  ✓ 推理高程预测: {pred_infer['pred_delta_z'].shape}")
+
+    total_params = sum(p.numel() for p in model.parameters())
+    v2_params_approx = total_params - sum(
+        p.numel() for name, p in model.named_parameters()
+        if any(m in name for m in ['btmamba', 'tcas', 'dger'])
+    )
+    v3_new_params = total_params - v2_params_approx
+    print(f"\n[模型参数统计]")
+    print(f"  ✓ 总参数量: {total_params:,}")
+    print(f"  ✓ V2继承参数: ~{v2_params_approx:,}")
+    print(f"  ✓ V3新增参数: ~{v3_new_params:,}")
+    print(f"  ✓ 参数增量: {v3_new_params/v2_params_approx*100:.1f}%")
+
+    print("\n" + "=" * 80)
+    print("✓ TSRNet V3 全部测试通过")
+    print("=" * 80)
