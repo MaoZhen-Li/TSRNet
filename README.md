@@ -25,8 +25,8 @@ This model requires a robust hardware environment due to the multi-task joint tr
 - **OS:** Linux (Ubuntu 20.04 / 22.04 recommended)
 - **GPU:** NVIDIA GPU with Compute Capability ≥ 8.0 (Ampere architecture or newer)
 - **VRAM:**
-  - Training: ≥ 24 GB (e.g., RTX 4090/5090, A100/A800)
-  - Inference: ≥ 20 GB
+  - Training: ≥ 16 GB (e.g., RTX 4090/5090, A100/A800)
+  - Inference: ≥ 10 GB
 - **CUDA:** 13.0 (strictly required for the Mamba installation steps below)
 
  🛠️ Installation
